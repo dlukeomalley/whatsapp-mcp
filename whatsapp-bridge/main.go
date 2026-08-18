@@ -40,7 +40,7 @@ import (
 // the account was linked". Chat rows (jid/name/last_message_time only, no content)
 // are kept indefinitely -- they're needed to resolve JIDs/names for sends and
 // list_chats and carry no message content.
-const messageRetentionDays = 7
+const messageRetentionDays = 30
 
 // Message represents a chat message for our client
 type Message struct {

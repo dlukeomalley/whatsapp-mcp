@@ -130,7 +130,7 @@ func TestPruneOldMessagesRespectsPerChatEphemeralCeiling(t *testing.T) {
 	}
 
 	// short@g.us: WhatsApp's own 24h disappearing timer -- shorter than our
-	// messageRetentionDays (7d) ceiling, so it should win and prune the 2-day-old row.
+	// messageRetentionDays (30d) ceiling, so it should win and prune the 2-day-old row.
 	mustStoreChat("short@g.us")
 	if err := store.SetChatEphemeral("short@g.us", 24*60*60); err != nil {
 		t.Fatalf("SetChatEphemeral: %v", err)
