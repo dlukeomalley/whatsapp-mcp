@@ -31,6 +31,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// messageRetentionDays bounds how long message CONTENT stays in the local mirror.
+// This bridge decrypts WhatsApp's E2E traffic and persists it in a plain, unencrypted
+// SQLite file with no retention controls upstream (there is no flag/env for this) --
+// left running, that's an unbounded plaintext archive of every group the linked
+// account is in, including people who never agreed to a third-party bridge keeping
+// their messages. Pruning bounds the exposure to "recent", not "everything since
+// the account was linked". Chat rows (jid/name/last_message_time only, no content)
+// are kept indefinitely -- they're needed to resolve JIDs/names for sends and
+// list_chats and carry no message content.
+const messageRetentionDays = 7
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -90,7 +101,40 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	if err := ensureEphemeralColumn(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate ephemeral_seconds column: %v", err)
+	}
+
 	return &MessageStore{db: db}, nil
+}
+
+// ensureEphemeralColumn adds chats.ephemeral_seconds on an existing store (SQLite has
+// no "ADD COLUMN IF NOT EXISTS" we can rely on across versions, so check PRAGMA
+// table_info first). NULL means "never resolved"; 0 means "resolved, not ephemeral";
+// >0 is WhatsApp's own disappearing-messages timer in seconds for that chat.
+func ensureEphemeralColumn(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(chats)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "ephemeral_seconds" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec("ALTER TABLE chats ADD COLUMN ephemeral_seconds INTEGER")
+	return err
 }
 
 // Close the database connection
@@ -98,12 +142,37 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Store a chat in the database. An UPSERT, not INSERT OR REPLACE: a plain REPLACE
+// would blow away ephemeral_seconds (resolved separately, see SetChatEphemeral) on
+// every single message, since REPLACE deletes-then-reinserts the whole row.
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time`,
 		jid, name, lastMessageTime,
 	)
+	return err
+}
+
+// EphemeralKnown reports whether this chat's disappearing-messages timer has ever
+// been resolved (via SetChatEphemeral) -- false means "never checked yet", which is
+// different from "checked, and it's not ephemeral" (stored as 0, Known=true).
+func (store *MessageStore) EphemeralKnown(jid string) (bool, error) {
+	var v sql.NullInt64
+	err := store.db.QueryRow("SELECT ephemeral_seconds FROM chats WHERE jid = ?", jid).Scan(&v)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return v.Valid, nil
+}
+
+// SetChatEphemeral records a chat's own disappearing-messages timer, in seconds (0
+// if the chat doesn't have disappearing messages on).
+func (store *MessageStore) SetChatEphemeral(jid string, seconds uint32) error {
+	_, err := store.db.Exec("UPDATE chats SET ephemeral_seconds = ? WHERE jid = ?", seconds, jid)
 	return err
 }
 
@@ -122,6 +191,71 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
+}
+
+// PruneOldMessages deletes message rows (content + media pointers) older than each
+// chat's EFFECTIVE retention window: its own WhatsApp disappearing-messages timer
+// (chats.ephemeral_seconds, resolved via GetGroupInfo/per-message IsEphemeral) when
+// that's set and SHORTER than messageRetentionDays, otherwise the flat
+// messageRetentionDays default. A chat's own setting can only shorten local
+// retention, never lengthen it past our ceiling -- respects what that chat's
+// participants opted into (e.g. a 24h-disappearing group gets pruned at 24h here
+// too) without letting a long-or-absent chat setting override our own privacy
+// default. Chat rows are untouched -- they carry no content, just
+// jid/name/last_message_time/ephemeral_seconds, and are still needed to resolve chats.
+// Returns the number of message rows removed across all chats.
+func (store *MessageStore) PruneOldMessages() (int64, error) {
+	ceiling := time.Duration(messageRetentionDays) * 24 * time.Hour
+
+	rows, err := store.db.Query("SELECT jid, ephemeral_seconds FROM chats")
+	if err != nil {
+		return 0, err
+	}
+	type target struct {
+		jid    string
+		retain time.Duration
+	}
+	var targets []target
+	for rows.Next() {
+		var jid string
+		var ephemeral sql.NullInt64
+		if err := rows.Scan(&jid, &ephemeral); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		retain := ceiling
+		if ephemeral.Valid && ephemeral.Int64 > 0 {
+			if chatTimer := time.Duration(ephemeral.Int64) * time.Second; chatTimer < retain {
+				retain = chatTimer
+			}
+		}
+		targets = append(targets, target{jid: jid, retain: retain})
+	}
+	closeErr := rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if closeErr != nil {
+		return 0, closeErr
+	}
+
+	now := time.Now()
+	var total int64
+	for _, t := range targets {
+		result, err := store.db.Exec(
+			"DELETE FROM messages WHERE chat_jid = ? AND timestamp < ?",
+			t.jid, now.Add(-t.retain),
+		)
+		if err != nil {
+			return total, err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // Get messages from a chat
@@ -408,6 +542,43 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// resolveChatEphemeral records a chat's disappearing-messages timer the first time
+// we see it, so PruneOldMessages can retain that chat only as long as its own
+// participants opted into (never longer than messageRetentionDays -- see
+// PruneOldMessages). Cheap after the first resolution: EphemeralKnown short-circuits
+// before any network call.
+//
+// Groups: client.GetGroupInfo already gets called here to resolve the chat's name
+// (see GetChatName) -- its IsEphemeral/DisappearingTimer fields are the exact,
+// authoritative setting, just previously discarded.
+//
+// DMs: whatsmeow has no per-DM "get disappearing timer" call, only the per-message
+// events.Message.IsEphemeral flag on each incoming message. That flag can't tell us
+// WHICH of WhatsApp's standard durations (24h/7d/90d) is active, so an ephemeral DM
+// is conservatively pinned to the shortest one (24h) -- deletes sooner than the true
+// setting might require, never later, which is the safe direction to be wrong in.
+func resolveChatEphemeral(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, isEphemeral bool, logger waLog.Logger) {
+	known, err := messageStore.EphemeralKnown(chatJID)
+	if err != nil || known {
+		return
+	}
+	var seconds uint32
+	if jid.Server == "g.us" {
+		groupInfo, err := client.GetGroupInfo(context.Background(), jid)
+		if err != nil {
+			return // try again next message rather than caching a failed lookup
+		}
+		if groupInfo.IsEphemeral {
+			seconds = groupInfo.DisappearingTimer
+		}
+	} else if isEphemeral {
+		seconds = 24 * 60 * 60
+	}
+	if err := messageStore.SetChatEphemeral(chatJID, seconds); err != nil {
+		logger.Warnf("Failed to store ephemeral timer for %s: %v", chatJID, err)
+	}
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
@@ -422,6 +593,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
 	}
+	resolveChatEphemeral(client, messageStore, msg.Info.Chat, chatJID, msg.IsEphemeral, logger)
 
 	// Extract text content
 	content := extractTextContent(msg.Message)
@@ -833,6 +1005,28 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+
+	// Bound local retention of message content (messageRetentionDays) instead of keeping
+	// an unbounded plaintext archive. Runs once at startup (covers any backlog from time
+	// the bridge was down) and then on a daily ticker for the life of the process.
+	go func() {
+		prune := func() {
+			deleted, err := messageStore.PruneOldMessages()
+			if err != nil {
+				logger.Warnf("Failed to prune old messages: %v", err)
+				return
+			}
+			if deleted > 0 {
+				logger.Infof("Pruned %d message(s) older than %d days", deleted, messageRetentionDays)
+			}
+		}
+		prune()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			prune()
+		}
+	}()
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
