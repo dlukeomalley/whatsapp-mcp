@@ -656,6 +656,26 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
+// CommunityGroup is one group linked to a Community, with its own roster size.
+type CommunityGroup struct {
+	JID          string `json:"jid"`
+	Name         string `json:"name"`
+	Participants int    `json:"participants"`
+	IsDefault    bool   `json:"is_default,omitempty"`
+}
+
+// CommunityResponse reports Community membership. MemberCount is deduplicated
+// across every linked group, so it is the Community total rather than the sum
+// of the per-group counts.
+type CommunityResponse struct {
+	Success       bool             `json:"success"`
+	Message       string           `json:"message,omitempty"`
+	Community     string           `json:"community,omitempty"`
+	CommunityName string           `json:"community_name,omitempty"`
+	MemberCount   int              `json:"member_count"`
+	Groups        []CommunityGroup `json:"groups,omitempty"`
+}
+
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -944,6 +964,110 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
+	})
+
+	// Handler for Community membership.
+	//
+	// A Community roster lives on WhatsApp's servers, not in the local store,
+	// so message history can only show who has spoken -- never how many people
+	// are actually in the room. This asks the server directly.
+	//
+	//   GET /api/community?jid=<community or member-group JID>
+	//
+	// A linked sub-group JID resolves up to its parent Community, so any group
+	// JID from the chats table is a valid entry point.
+	http.HandleFunc("/api/community", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		raw := r.URL.Query().Get("jid")
+		if raw == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(CommunityResponse{Success: false, Message: "jid query parameter is required"})
+			return
+		}
+		jid, err := types.ParseJID(raw)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(CommunityResponse{Success: false, Message: fmt.Sprintf("invalid jid: %v", err)})
+			return
+		}
+		// Reject non-group JIDs up front. A group IQ addressed to a user JID is never
+		// answered, so without this the request just hangs until the caller's timeout
+		// and then looks like an unreachable bridge rather than a bad argument.
+		if jid.Server != types.GroupServer {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(CommunityResponse{
+				Success: false,
+				Message: fmt.Sprintf("%s is not a group jid (expected a @%s address)", raw, types.GroupServer),
+			})
+			return
+		}
+
+		ctx := context.Background()
+		info, err := client.GetGroupInfo(ctx, jid)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(CommunityResponse{Success: false, Message: fmt.Sprintf("failed to get group info: %v", err)})
+			return
+		}
+
+		// Resolve to the parent Community: a Community names itself, a linked
+		// sub-group names its parent, and anything else stands alone.
+		community := jid
+		communityName := info.Name
+		switch {
+		case info.IsParent:
+			// jid is already the Community
+		case !info.LinkedParentJID.IsEmpty():
+			community = info.LinkedParentJID
+			communityName = ""
+			if parent, perr := client.GetGroupInfo(ctx, community); perr == nil {
+				communityName = parent.Name
+			}
+		default:
+			json.NewEncoder(w).Encode(CommunityResponse{
+				Success:     true,
+				Message:     "group is not linked to a community; reporting this group only",
+				MemberCount: len(info.Participants),
+				Groups: []CommunityGroup{{
+					JID:          info.JID.String(),
+					Name:         info.Name,
+					Participants: len(info.Participants),
+				}},
+			})
+			return
+		}
+
+		resp := CommunityResponse{Success: true, Community: community.String(), CommunityName: communityName}
+
+		// Deduplicated members across every linked group -- the Community total.
+		if members, merr := client.GetLinkedGroupsParticipants(ctx, community); merr != nil {
+			resp.Message = fmt.Sprintf("community member list unavailable: %v", merr)
+		} else {
+			resp.MemberCount = len(members)
+		}
+
+		// Per-group breakdown. A failure here still leaves MemberCount useful.
+		subs, serr := client.GetSubGroups(ctx, community)
+		if serr != nil {
+			if resp.Message != "" {
+				resp.Message += "; "
+			}
+			resp.Message += fmt.Sprintf("sub-group list unavailable: %v", serr)
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+		for _, sub := range subs {
+			g := CommunityGroup{JID: sub.JID.String(), Name: sub.Name, IsDefault: sub.IsDefaultSubGroup}
+			if gi, gerr := client.GetGroupInfo(ctx, sub.JID); gerr == nil {
+				g.Participants = len(gi.Participants)
+				if g.Name == "" {
+					g.Name = gi.Name
+				}
+			}
+			resp.Groups = append(resp.Groups, g)
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 
 	// Start the server
