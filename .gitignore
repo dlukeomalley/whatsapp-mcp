@@ -2,3 +2,7 @@
 claude_desktop_config.json
 whatsapp.log
 whatsapp-bridge/whatsapp-bridge
+# The bridge's own store: the message database is covered by *.db above, but downloaded
+# media lands beside it as ordinary image and video files, so the directory has to go too.
+# Everything under it is one person's conversations.
+whatsapp-bridge/store/
