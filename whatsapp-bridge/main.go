@@ -782,8 +782,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Generate a local path for the file. The message id is part of the name: WhatsApp
+	// names photos image_YYYYMMDD_HHMMSS.jpg, so two photos posted in the same second
+	// share a filename, and a name-only path silently returned the first one for both.
+	localPath = fmt.Sprintf("%s/%s_%s", chatDir, messageID, filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -860,8 +862,10 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
+	// Keep the signed query (ccb/oh/oe/_nc_sid): the CDN answers 403 to the bare path, and
+	// whatsmeow appends its own "&hash=..." expecting a "?" to already be present. Only the
+	// trailing mms3 flag is dropped, since whatsmeow re-adds it.
+	pathPart = strings.TrimSuffix(pathPart, "&mms3=true")
 
 	// Create proper direct path format
 	return "/" + pathPart
