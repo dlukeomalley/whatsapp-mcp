@@ -1,0 +1,29 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: check-yaml
+      - id: check-json
+      - id: detect-private-key
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+  - repo: git@github.com:foglinelabs/eng-rig.git
+    rev: ad00aec74aea20bb42d3cc3b214f1f3d74eb9403
+    hooks:
+      - id: installed-fresh
+        args: [--require, agents, --require, hooks, --require, skills, --require, claude-skills]
+  - repo: local
+    hooks:
+      - id: bridge
+        name: Go bridge format, vet and tests
+        entry: make check
+        language: system
+        pass_filenames: false
+        require_serial: true
+        files: '^(whatsapp-bridge/.*\.(go|mod|sum)$|Makefile$|\.pre-commit-config\.yaml$)'
