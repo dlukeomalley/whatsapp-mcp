@@ -1,5 +1,5 @@
 .PHONY: check
 check:
-	@test -z "$$(gofmt -l whatsapp-bridge/*.go)" || { gofmt -d whatsapp-bridge/*.go; exit 1; }
+	@test -z "$$(gofmt -l whatsapp-bridge)" || { gofmt -d whatsapp-bridge; exit 1; }
 	cd whatsapp-bridge && go vet ./...
 	cd whatsapp-bridge && go test ./...

@@ -10,10 +10,12 @@ instead of guessing.
 Writes only, never reads: measuring, benchmarking and writing to scratch
 space stay shell work. A command is refused only when it both performs a
 write and names a file `git ls-files` lists in the repository containing
-the command's working directory. In-place editors match on a flag cluster
-containing `i` (`perl -0pi`, `sed -Ei`), a redirect is judged by its own
-target (so `2>/dev/null` does not disarm the check), and bare filenames
-resolve against the cwd and every `cd` in the command.
+the command's working directory or in any of that repository's worktrees.
+In-place editors match on a flag cluster containing `i` (`perl -0pi`,
+`sed -Ei`), a redirect is judged by its own target (so `2>/dev/null` does
+not disarm the check), bare filenames resolve against the cwd and every
+`cd` in the command, and a `$NAME` or `${NAME}` the command assigns
+(`L=/path/to/worktree; sed -i ... $L/file`) is expanded before any of it.
 
 Installed by eng-rig into `.claude/hooks/` and wired as a PreToolUse hook on
 Bash; exit 2 denies with the message on stderr.
@@ -42,6 +44,7 @@ _REDIRECT = re.compile(r"(?<![-=<>])>>?\s*([\w./~-]+\.[A-Za-z0-9_]+)")
 _ALWAYS_FINE = ("/tmp/", "/private/tmp/", "scratchpad", "/dev/null")
 _PATH_TOKEN = re.compile(r"[\w./~-]+\.[A-Za-z0-9_]+")
 _CD = re.compile(r"\bcd\s+([^\s;&|)]+)")
+_ASSIGN = re.compile(r"(?:^|[\s;&|(])([A-Za-z_]\w*)=('[^']*'|\"[^\"]*\"|[^\s;&|)]+)")
 
 
 def repo_root(cwd: str | None) -> Path | None:
@@ -57,6 +60,34 @@ def repo_root(cwd: str | None) -> Path | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return Path(done.stdout.strip()) if done.returncode == 0 else None
+
+
+def expand_assigned(command: str) -> str:
+    """`command` with each `$NAME`/`${NAME}` it assigns replaced by the value."""
+    for name, quoted in _ASSIGN.findall(command):
+        value = quoted.strip("'\"")
+        command = re.sub(rf"\$(?:\{{{name}\}}|{name}\b)", lambda _, v=value: v, command)
+    return command
+
+
+def _worktrees(repo: Path) -> list[Path]:
+    """Every worktree of `repo`'s repository, `repo` first."""
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return [repo]
+    others = [
+        Path(line.removeprefix("worktree "))
+        for line in done.stdout.splitlines()
+        if line.startswith("worktree ")
+    ]
+    return [repo, *(w for w in others if w.resolve() != repo.resolve())]
 
 
 def _tracked(repo: Path) -> set[str]:
@@ -89,23 +120,35 @@ def _bases(command: str, cwd: Path, repo: Path) -> list[Path]:
 
 
 def offending_paths(command: str, cwd: str | None, repo: Path) -> list[str]:
-    """Tracked files `command` looks like it writes."""
+    """Tracked files `command` looks like it writes, each worktree but
+    `repo` named by its absolute path."""
+    command = expand_assigned(command)
     redirects = _REDIRECT.findall(command)
     if not any(p.search(command) for p in _WRITES):
         if not redirects or all(any(f in t for f in _ALWAYS_FINE) for t in redirects):
             return []
     tracked = _tracked(repo)
     hits = {path for path in tracked if path and _names_repo_file(command, path)}
+    trees = _worktrees(repo)
+    tracked_in: dict[Path, set[str]] = {repo: tracked}
     for token in _PATH_TOKEN.findall(command):
         for base in _bases(command, Path(cwd) if cwd else repo, repo):
-            try:
-                relative = (base / token).resolve().relative_to(repo.resolve()).as_posix()
-            except (ValueError, OSError):
-                continue
-            if relative in tracked:
-                hits.add(relative)
+            hit = _tracked_hit(base / token, trees, tracked_in)
+            if hit:
+                hits.add(hit)
                 break
     return sorted(hits)
+
+
+def _tracked_hit(path: Path, trees: list[Path], tracked_in: dict[Path, set[str]]) -> str | None:
+    for tree in trees:
+        try:
+            relative = path.resolve().relative_to(tree.resolve()).as_posix()
+        except (ValueError, OSError):
+            continue
+        if relative in tracked_in.setdefault(tree, _tracked(tree)):
+            return relative if tree is trees[0] else str(tree / relative)
+    return None
 
 
 def main() -> int:
